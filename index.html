@@ -357,7 +357,7 @@ function renderThumbs() {
     const im = document.createElement('img');
     im.src = p.data; im.alt = '写真' + (i + 1);
     d.appendChild(im);
-    if (p.status === 'wait' && !busy) {
+    if (p.status === 'wait' && !busy && !started) {
       const x = document.createElement('button');
       x.type = 'button'; x.className = 'x'; x.textContent = '×'; x.setAttribute('aria-label', '写真' + (i + 1) + 'を外す');
       x.onclick = () => { photos.splice(i, 1); renderThumbs(); };
@@ -370,7 +370,51 @@ function renderThumbs() {
   $('count').textContent = photos.length ? photos.length + '枚選択中' : '';
 }
 
+/* ---------- 撮影日時(Exif)の書き込み:スマホ側で行い、サーバーの処理を軽くする ---------- */
+function exifDateFor(date) {
+  // 作業日が今日なら今の時刻、別の日なら12:00
+  const now = new Date();
+  const hms = date === today()
+    ? [now.getHours(), now.getMinutes(), now.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':')
+    : '12:00:00';
+  return date.replace(/-/g, ':') + ' ' + hms;
+}
+
+function addExifDate(bytes, dateStr) {
+  const dt = [];
+  for (let i = 0; i < 19; i++) dt.push(dateStr.charCodeAt(i));
+  dt.push(0);
+  const u16 = (v) => [(v >> 8) & 255, v & 255];
+  const u32 = (v) => [(v >>> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255];
+  const entry = (tag, type, count, value) => [].concat(u16(tag), u16(type), u32(count), u32(value));
+  let tiff = [0x4D, 0x4D, 0x00, 0x2A].concat(u32(8));
+  tiff = tiff.concat(u16(2), entry(0x0132, 2, 20, 38), entry(0x8769, 4, 1, 58), u32(0), dt);
+  tiff = tiff.concat(u16(2), entry(0x9003, 2, 20, 88), entry(0x9004, 2, 20, 108), u32(0), dt, dt);
+  const payload = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00].concat(tiff);
+  const app1 = [0xFF, 0xE1].concat(u16(payload.length + 2), payload);
+  let p = 2; // SOIの直後(JFIFの見出しがあればその後ろ)に入れる
+  if (bytes[2] === 0xFF && bytes[3] === 0xE0) p = 4 + ((bytes[4] << 8) | bytes[5]);
+  const out = new Uint8Array(bytes.length + app1.length);
+  out.set(bytes.subarray(0, p), 0);
+  out.set(app1, p);
+  out.set(bytes.subarray(p), p + app1.length);
+  return out;
+}
+
+function prepareUpload(dataUrl, date) {
+  const bin = atob(dataUrl.split(',')[1]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const out = addExifDate(bytes, exifDateFor(date));
+  let str = '';
+  for (let i = 0; i < out.length; i += 0x8000) str += String.fromCharCode.apply(null, out.subarray(i, i + 0x8000));
+  return btoa(str);
+}
+
 /* ---------- 送信 ---------- */
+let started = false;   // 送信の準備が済んだら、日付・物件・写真は変更できない
+const PARALLEL = 3;    // 同時に送る写真の枚数
+
 $('submit').onclick = () => send();
 $('retry').onclick = () => send();
 
@@ -388,32 +432,68 @@ async function send() {
   setBusy(true);
   $('retry').style.display = 'none';
 
-  // 写真を1枚ずつ送る(どの写真にも作業日と物件名が付いている)
-  for (let i = 0; i < photos.length; i++) {
-    const p = photos[i];
-    if (p.status === 'ok') continue;
-    p.status = 'sending'; renderThumbs();
-    showMsg('info', '送信中… ' + (i + 1) + ' / ' + photos.length + '枚');
-    let ok = false;
-    for (let t = 0; t < 2 && !ok; t++) {
+  if (photos.length) {
+    // 1) 送信の準備(保存先とファイル名をサーバーで用意)
+    if (!started) {
+      showMsg('info', '送信の準備をしています…');
       try {
-        await call({ action: 'photo', mode: isReport ? 'report' : 'photo', batchId, index: i,
-          date, property: chosen, content, image: p.data });
-        ok = true;
+        await call({ action: 'begin', batchId, mode: isReport ? 'report' : 'photo',
+          date, property: chosen, content, count: photos.length });
+        started = true;
       } catch (err) {
-        p.error = err.message;
+        setBusy(false);
+        showMsg('err', '送信を始められませんでした(' + err.message + ')。\n電波の良い場所で「送り直す」を押してください。');
+        $('retry').style.display = 'block';
+        return;
       }
     }
-    p.status = ok ? 'ok' : 'ng';
-    renderThumbs();
-  }
 
-  const failed = photos.filter((p) => p.status !== 'ok');
-  if (failed.length) {
-    setBusy(false);
-    showMsg('err', failed.length + '枚送れませんでした(' + (failed[0].error || '') + ')。\n電波の良い場所で「送り直す」を押してください。送れた写真はそのまま保存されています。');
-    $('retry').style.display = 'block';
-    return;
+    // 2) 写真を3枚ずつ同時に送る(どの写真も、準備した物件のフォルダに入る)
+    let done = photos.filter((p) => p.status === 'ok').length;
+    showMsg('info', '送信中… ' + done + ' / ' + photos.length + '枚');
+    let next = 0;
+    const worker = async () => {
+      while (next < photos.length) {
+        const i = next++;
+        const p = photos[i];
+        if (p.status === 'ok') continue;
+        p.status = 'sending'; renderThumbs();
+        let ok = false;
+        for (let t = 0; t < 2 && !ok; t++) {
+          try {
+            if (!p.up) p.up = prepareUpload(p.data, date);
+            await call({ action: 'photo', batchId, index: i, image: p.up });
+            ok = true;
+          } catch (err) {
+            p.error = err.message;
+          }
+        }
+        p.status = ok ? 'ok' : 'ng';
+        if (ok) done++;
+        renderThumbs();
+        showMsg('info', '送信中… ' + done + ' / ' + photos.length + '枚');
+      }
+    };
+    await Promise.all(Array.from({ length: PARALLEL }, worker));
+
+    const failed = photos.filter((p) => p.status !== 'ok');
+    if (failed.length) {
+      setBusy(false);
+      showMsg('err', failed.length + '枚送れませんでした(' + (failed[0].error || '') + ')。\n電波の良い場所で「送り直す」を押してください。送れた写真はそのまま保存されています。');
+      $('retry').style.display = 'block';
+      return;
+    }
+
+    // 3) 仕上げ(写真台帳にまとめて記録)
+    try {
+      showMsg('info', '記録しています…');
+      await call({ action: 'finish', batchId });
+    } catch (err) {
+      setBusy(false);
+      showMsg('err', '記録を完了できませんでした(' + err.message + ')。写真は保存されています。「送り直す」を押してください。');
+      $('retry').style.display = 'block';
+      return;
+    }
   }
 
   if (isReport) {
@@ -438,6 +518,7 @@ async function send() {
   } catch (e) { /* トークの外から開いた場合などは送れないが、保存は完了している */ }
 
   setBusy(false);
+  hideMsg();
   $('form').hidden = true;
   $('done').hidden = false;
   $('doneTitle').textContent = isReport ? '報告を送信しました' : '保存しました';
@@ -449,9 +530,10 @@ async function send() {
 function setBusy(v) {
   busy = v;
   $('submit').disabled = v;
-  $('date').disabled = v;
-  $('files').disabled = v;
-  $('changeProp').disabled = v;
+  $('date').disabled = v || started;
+  $('files').disabled = v || started;
+  $('changeProp').disabled = v || started;
+  $('content').disabled = v || started;
   renderThumbs();
 }
 
@@ -464,7 +546,8 @@ function showMsg(type, text) {
 function hideMsg() { $('msg').className = 'msg'; }
 
 $('again').onclick = () => {
-  photos = []; batchId = ''; chosen = '';
+  photos = []; batchId = ''; chosen = ''; started = false;
+  setBusy(false);
   $('content').value = ''; $('urgent').checked = false;
   $('chosen').hidden = true; $('propSearch').hidden = false; $('propInput').value = '';
   renderThumbs(); renderCands(); hideMsg();
